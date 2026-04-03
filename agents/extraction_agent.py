@@ -1,0 +1,105 @@
+import json
+import re
+from datetime import datetime
+from typing import Dict
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import HumanMessage
+from agents.state import VerificationState
+from utils.logger import make_log
+
+EXTRACTION_SYSTEM = """You are an expert document information extraction agent.
+Your task is to analyze a document image and extract ALL visible text fields and their values.
+
+Extract every identifiable field such as:
+- Full Name / Name on Document
+- Date of Birth
+- Document/ID Number  
+- Address
+- Issue Date / Date of Issue
+- Expiry Date / Valid Until
+- Issuing Authority / Issued By
+- Document Type (Passport, Aadhaar, PAN, Driving License, Certificate, etc.)
+- Nationality / Country
+- Gender
+- Any other relevant fields visible on the document
+
+Return ONLY a valid JSON object. No markdown, no backticks, no explanation.
+Keys should be clean snake_case field names (e.g. "full_name", "date_of_birth").
+Values should be the extracted text exactly as it appears. 
+If a field is not found or not readable, use null.
+
+Example format:
+{"document_type": "Aadhaar Card", "full_name": "John Doe", "date_of_birth": "01/01/1990", "id_number": "1234 5678 9012", "address": "123 Main St, City", "gender": "Male", "issue_date": null}"""
+
+
+def extraction_agent(state: VerificationState) -> dict:
+    """Extract fields from document using Gemini Vision."""
+    logs = [make_log("ExtractionAgent", "STARTED", "Beginning document field extraction")]
+
+    try:
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            temperature=0,
+        )
+
+        message = HumanMessage(
+            content=[
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{state['document_base64']}"
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": EXTRACTION_SYSTEM,
+                },
+            ]
+        )
+
+        logs.append(make_log("ExtractionAgent", "LLM_CALL", "Sending document to Gemini 2.5 Flash for OCR extraction"))
+        response = llm.invoke([message])
+        raw = response.content.strip()
+
+        # Strip markdown code fences if present
+        raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+        extracted = json.loads(raw)
+
+        # Filter out None values but keep them as empty string with note
+        cleaned = {}
+        for k, v in extracted.items():
+            cleaned[k] = str(v) if v is not None else ""
+
+        doc_type = cleaned.get("document_type", "Unknown Document")
+        logs.append(
+            make_log(
+                "ExtractionAgent",
+                "EXTRACTION_COMPLETE",
+                f"Extracted {len(cleaned)} fields from '{doc_type}': {', '.join(cleaned.keys())}",
+                "SUCCESS",
+            )
+        )
+
+        return {
+            "extracted_fields": cleaned,
+            "document_type": doc_type,
+            "logs": logs,
+            "current_step": "extraction_done",
+        }
+
+    except json.JSONDecodeError as e:
+        logs.append(make_log("ExtractionAgent", "PARSE_ERROR", f"Failed to parse JSON response: {e}", "ERROR"))
+        return {
+            "extracted_fields": {},
+            "logs": logs,
+            "error": f"Extraction JSON parse error: {e}",
+            "current_step": "extraction_error",
+        }
+    except Exception as e:
+        logs.append(make_log("ExtractionAgent", "ERROR", str(e), "ERROR"))
+        return {
+            "extracted_fields": {},
+            "logs": logs,
+            "error": str(e),
+            "current_step": "extraction_error",
+        }
